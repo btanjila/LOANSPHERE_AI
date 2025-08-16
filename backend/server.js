@@ -1,12 +1,22 @@
 // backend/server.js
 import dotenv from 'dotenv';
-dotenv.config();
-
 import express from 'express';
 import colors from 'colors';
-import cors from 'cors';
+import cors from 'cors'; // Changed from require() to import
 import morgan from 'morgan';
 import cookieParser from 'cookie-parser';
+
+dotenv.config();
+
+const app = express();
+
+// CORS Configuration (Simplified)
+app.use(cors({
+  origin: process.env.CLIENT_URL || 'http://localhost:3000',
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
 
 import connectDB from './config/db.js';
 import loanRoutes from './routes/loanRoutes.js';
@@ -22,7 +32,6 @@ connectDB();
 console.log('JWT_SECRET:', process.env.JWT_SECRET ? 'Loaded' : 'NOT Loaded');
 console.log('NODE_ENV:', process.env.NODE_ENV);
 
-const app = express();
 import adminRoutes from './routes/adminRoutes.js';
 app.use('/api/admin', adminRoutes);
 
