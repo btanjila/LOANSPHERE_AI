@@ -2,27 +2,21 @@
 import express from 'express';
 import Loan from '../models/Loan.js';
 import User from '../models/UserModel.js';
+import { protect, authorize } from '../middleware/authMiddleware.js';
 
 const router = express.Router();
 
-/**
- * GET /api/admin/stats
- * Returns real counts + aggregated amounts from MongoDB
- */
-router.get('/stats', async (req, res) => {
+router.get('/stats', protect, authorize(['admin']), async (req, res) => {
   try {
-    // Loan counts
     const totalLoans = await Loan.countDocuments();
     const approvedLoans = await Loan.countDocuments({ status: 'approved' });
     const pendingLoans = await Loan.countDocuments({ status: 'pending' });
     const rejectedLoans = await Loan.countDocuments({ status: 'rejected' });
 
-    // User counts
     const totalUsers = await User.countDocuments();
     const borrowers = await User.countDocuments({ role: 'borrower' });
     const admins = await User.countDocuments({ role: 'admin' });
 
-    // Loan amounts aggregation
     const amountStats = await Loan.aggregate([
       {
         $group: {

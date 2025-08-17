@@ -1,29 +1,30 @@
 // backend/controllers/loanController.js
-
+import mongoose from 'mongoose';
 import Loan from '../models/Loan.js';
 import User from '../models/UserModel.js';
 import calculateEMI from '../utils/calculateEMI.js';
 import { fetchCibilScore } from '../utils/cibilService.js';
 import { evaluateLoanRisk } from '../utils/loanRiskEvaluator.js';
 import { sendEmail } from '../utils/emailService.js';
-
-/* ------------------------------------------------------------------
- * Small helpers
- * ------------------------------------------------------------------ */
+import { disburseLoan, payEMI } from './walletController.js';
+import Wallet from '../models/WalletModel.js';
+/* ========================================================================
+ * Small utilities
+ * ====================================================================== */
 
 /** Standard server error responder */
 const respondServerError = (res, context, err) => {
-  console.error(`${context} error:`, err);
+  console.error(`❌ ${context} error:`, err);
   return res.status(500).json({ success: false, message: 'Server error' });
 };
 
-/** Robust number parsing (null-safe) */
+/** Robust number parsing (null-safe, with default) */
 const num = (v, d = 0) => {
   const n = Number(v);
   return Number.isFinite(n) ? n : d;
 };
 
-/** Quick role gate */
+/** Simple role guard */
 const assertRole = (req, res, roles) => {
   const ok = roles.includes(req.user?.role);
   if (!ok) {
@@ -32,12 +33,7 @@ const assertRole = (req, res, roles) => {
   return ok;
 };
 
-/**
- * Normalize a Loan document (or plain object) for the frontend:
- *  - Adds `user` mirror of `borrower`
- *  - Normalizes `amount` to `amountRequested` if present
- *  - Strips sensitive nested fields
- */
+/** Normalize a Loan doc for frontend (strip secrets, keep aliases stable) */
 const normalizeLoanForFrontend = (loanDocOrObj) => {
   if (!loanDocOrObj) return loanDocOrObj;
 
@@ -46,30 +42,37 @@ const normalizeLoanForFrontend = (loanDocOrObj) => {
       ? loanDocOrObj.toObject()
       : { ...loanDocOrObj };
 
-  // mirror borrower to user for frontend table convenience
+  // Frontend convenience: mirror borrower to user
   loan.user = loan.borrower || loan.user || null;
 
-  // amount aliasing to keep UI stable
+  // Normalize amount field if UI expects `amount`
   loan.amount =
     loan.amountRequested != null
       ? Number(loan.amountRequested)
       : num(loan.amount);
 
-  // safety: remove secrets if somehow present
-  if (loan.user && typeof loan.user === 'object') {
-    if ('password' in loan.user) delete loan.user.password;
-    if ('refreshToken' in loan.user) delete loan.user.refreshToken;
-  }
+  // Remove any sensitive subfields
+  const scrubUser = (u) => {
+    if (!u || typeof u !== 'object') return u;
+    const c = { ...u };
+    delete c.password;
+    delete c.refreshToken;
+    if (c.kyc) {
+      delete c.kyc.aadhaarNumber;
+      delete c.kyc.panNumber;
+    }
+    return c;
+  };
 
-  // lenders list may include embedded users – trim sensitive subfields
+  if (loan.borrower && typeof loan.borrower === 'object') {
+    loan.borrower = scrubUser(loan.borrower);
+    loan.user = loan.borrower;
+  }
   if (Array.isArray(loan.lenders)) {
     loan.lenders = loan.lenders.map((ln) => {
       const clean = { ...ln };
       if (clean.lender && typeof clean.lender === 'object') {
-        const l = { ...clean.lender };
-        delete l.password;
-        delete l.refreshToken;
-        clean.lender = l;
+        clean.lender = scrubUser(clean.lender);
       }
       return clean;
     });
@@ -78,33 +81,31 @@ const normalizeLoanForFrontend = (loanDocOrObj) => {
   return loan;
 };
 
-/** Email sender that supports both object-style and legacy signature */
+/** Email sender with graceful fallback for object/legacy signatures */
 const sendEmailSafe = async ({ to, subject, text, html }) => {
   if (!to || !subject) return;
   if (typeof sendEmail !== 'function') {
     console.warn('sendEmail is not a function');
     return;
   }
-
-  // Try modern/object call
   try {
+    // object signature
     await sendEmail({ to, subject, text, html });
     return;
-  } catch (errObjCall) {
-    // Fall back to legacy signature: (to, subject, body)
+  } catch {
+    // legacy signature
   }
-
   try {
     const body = html ?? text ?? '';
     await sendEmail(to, subject, body);
-  } catch (errSigCall) {
-    console.error('Failed to send email (both attempts):', errSigCall);
+  } catch (err) {
+    console.error('Failed to send email (both attempts):', err);
   }
 };
 
-/* ------------------------------------------------------------------
+/* ========================================================================
  * Controllers
- * ------------------------------------------------------------------ */
+ * ====================================================================== */
 
 /**
  * POST /api/loans
@@ -115,7 +116,7 @@ const applyLoan = async (req, res) => {
   try {
     if (!assertRole(req, res, ['borrower'])) return;
 
-    const { amount, tenure, interestRate, purpose } = req.body;
+    const { amount, tenure, interestRate, purpose } = req.body || {};
     const parsedAmount = num(amount);
     const parsedTenure = num(tenure);
     const parsedInterest = num(interestRate, null);
@@ -124,19 +125,19 @@ const applyLoan = async (req, res) => {
       !parsedAmount || parsedAmount <= 0 ||
       !parsedTenure || parsedTenure <= 0 ||
       parsedInterest == null || parsedInterest < 0 ||
-      !purpose || typeof purpose !== 'string'
+      !purpose || typeof purpose !== 'string' || !purpose.trim()
     ) {
       return res.status(400).json({
         success: false,
         message:
-          'Valid amount (>0), tenure (>0 months), interestRate (>=0) and purpose (string) are required',
+          'Valid amount (>0), tenure (>0 months), interestRate (>=0) and purpose (non-empty string) are required',
       });
     }
 
-    // EMI calculation
+    // EMI calculation (returns { emi, totalPayment, emiSchedule })
     const emiDetails = calculateEMI(parsedAmount, parsedTenure, parsedInterest);
 
-    // Try external CIBIL, then fall back to user-stored/default
+    // Try external CIBIL first, then fallback to profile/default
     let cibilScore = null;
     try {
       const fetched = await fetchCibilScore({
@@ -146,11 +147,12 @@ const applyLoan = async (req, res) => {
         email: req.user?.email,
       });
 
-      if (typeof fetched === 'number' && !Number.isNaN(fetched)) {
+      if (typeof fetched === 'number' && Number.isFinite(fetched)) {
         cibilScore = fetched;
       } else if (fetched && typeof fetched === 'object') {
-        const possible = fetched.score ?? fetched.cibilScore ?? fetched.data?.score;
-        if (typeof possible === 'number' && !Number.isNaN(possible)) cibilScore = possible;
+        const possible =
+          fetched.score ?? fetched.cibilScore ?? fetched.data?.score ?? fetched?.result?.score;
+        if (typeof possible === 'number' && Number.isFinite(possible)) cibilScore = possible;
       }
     } catch (e) {
       console.warn('CIBIL service error (falling back):', e?.message || e);
@@ -162,7 +164,7 @@ const applyLoan = async (req, res) => {
       amount: parsedAmount,
       tenure: parsedTenure,
       cibilScore,
-      purpose,
+      purpose: purpose.trim(),
     });
 
     // Persist loan
@@ -171,7 +173,7 @@ const applyLoan = async (req, res) => {
       amountRequested: parsedAmount,
       tenure: parsedTenure,
       interestRate: parsedInterest,
-      purpose: (purpose || '').trim(),
+      purpose: purpose.trim(),
       emi: emiDetails.emi,
       totalPayment: emiDetails.totalPayment,
       emiSchedule: emiDetails.emiSchedule,
@@ -182,7 +184,7 @@ const applyLoan = async (req, res) => {
       transactions: [],
     });
 
-    // Fire-and-forget notify
+    // Fire-and-forget notify borrower
     (async () => {
       await sendEmailSafe({
         to: req.user.email,
@@ -193,10 +195,13 @@ const applyLoan = async (req, res) => {
       });
     })().catch(() => {});
 
-    const loanObj = normalizeLoanForFrontend(loan);
     return res
       .status(201)
-      .json({ success: true, message: 'Loan application submitted successfully', loan: loanObj });
+      .json({
+        success: true,
+        message: 'Loan application submitted successfully',
+        loan: normalizeLoanForFrontend(loan),
+      });
   } catch (error) {
     return respondServerError(res, 'Apply loan', error);
   }
@@ -212,70 +217,35 @@ const fundLoan = async (req, res) => {
     if (!assertRole(req, res, ['lender'])) return;
 
     const addAmount = num(req.body?.amount);
-    if (!addAmount || addAmount <= 0) {
-      return res.status(400).json({ success: false, message: 'Funding amount must be a positive number' });
-    }
+    if (!addAmount || addAmount <= 0) return res.status(400).json({ success: false, message: 'Amount must be positive' });
 
     const loan = await Loan.findById(req.params.id);
     if (!loan) return res.status(404).json({ success: false, message: 'Loan not found' });
+    if (!['approved', 'funding'].includes(loan.status)) return res.status(400).json({ success: false, message: 'Loan not open for funding' });
 
-    if (!['approved', 'funding'].includes(loan.status)) {
-      return res.status(400).json({ success: false, message: 'Loan not open for funding' });
-    }
+    const remaining = num(loan.amountRequested) - num(loan.amountFunded);
+    if (addAmount > remaining) return res.status(400).json({ success: false, message: `Exceeds remaining: ${remaining}` });
 
-    const newAmountFunded = num(loan.amountFunded) + addAmount;
-    if (newAmountFunded > num(loan.amountRequested)) {
-      return res.status(400).json({ success: false, message: 'Funding exceeds requested amount' });
-    }
-
-    loan.lenders = Array.isArray(loan.lenders) ? loan.lenders : [];
+    loan.amountFunded += addAmount;
     loan.lenders.push({ lender: req.user._id, amount: addAmount, dateFunded: new Date() });
-    loan.amountFunded = newAmountFunded;
 
-    if (loan.amountFunded >= num(loan.amountRequested)) {
-      // Fully funded → mark disbursed and create disbursement tx
+    if (loan.amountFunded >= loan.amountRequested) {
       loan.status = 'disbursed';
-      loan.transactions = Array.isArray(loan.transactions) ? loan.transactions : [];
-      loan.transactions.push({
-        type: 'disbursement',
-        amount: num(loan.amountRequested),
-        date: new Date(),
-        from: null,
-        to: loan.borrower,
-        remarks: 'Loan fully funded and disbursed',
-      });
-    } else {
+      await loan.save();
+      await disburseLoan(loan._id);
+    } else if (loan.status === 'approved') {
       loan.status = 'funding';
+      await loan.save();
+    } else {
+      await loan.save();
     }
 
-    await loan.save();
-
-    // notify borrower (non-blocking)
-    (async () => {
-      try {
-        await loan.populate({ path: 'borrower', select: 'email name' });
-        const borrowerEmail = loan.borrower?.email;
-        if (borrowerEmail) {
-          await sendEmailSafe({
-            to: borrowerEmail,
-            subject: 'Loan Funding Update',
-            text:
-              loan.status === 'disbursed'
-                ? `Your loan has been fully funded and disbursed.`
-                : `Your loan has received a new funding of ₹${addAmount.toLocaleString('en-IN')}. Total funded: ₹${loan.amountFunded.toLocaleString('en-IN')}.`,
-          });
-        }
-      } catch (e) {
-        console.warn('Funding notification suppressed:', e?.message || e);
-      }
-    })().catch(() => {});
-
-    const loanObj = normalizeLoanForFrontend(loan);
-    return res.json({ success: true, message: 'Loan funded successfully', loan: loanObj });
+    res.json({ success: true, message: 'Loan funded', loan: normalizeLoanForFrontend(loan) });
   } catch (error) {
-    return respondServerError(res, 'Fund loan', error);
+    respondServerError(res, 'Fund loan', error);
   }
 };
+
 
 /**
  * POST /api/loans/repayment
@@ -288,72 +258,40 @@ const recordRepayment = async (req, res) => {
 
     const { loanId, amount } = req.body;
     const payAmount = num(amount);
-
-    if (!loanId || !payAmount || payAmount <= 0) {
-      return res.status(400).json({ success: false, message: 'Loan ID and positive amount are required' });
-    }
+    if (!loanId || payAmount <= 0) return res.status(400).json({ success: false, message: 'Loan ID and positive amount required' });
 
     const loan = await Loan.findById(loanId);
     if (!loan) return res.status(404).json({ success: false, message: 'Loan not found' });
+    if (loan.borrower.toString() !== req.user._id.toString()) return res.status(403).json({ success: false, message: 'Unauthorized' });
+    if (loan.status !== 'disbursed') return res.status(400).json({ success: false, message: 'Loan not active for repayment' });
 
-    // owner check
-    const borrowerIdStr =
-      loan.borrower && typeof loan.borrower.toString === 'function'
-        ? loan.borrower.toString()
-        : `${loan.borrower}`;
-
-    if (borrowerIdStr !== req.user._id.toString()) {
-      return res.status(403).json({ success: false, message: 'Unauthorized' });
-    }
-
-    if (loan.status !== 'disbursed') {
-      return res.status(400).json({ success: false, message: 'Loan not active for repayment' });
-    }
-
-    const schedule = Array.isArray(loan.emiSchedule) ? loan.emiSchedule : [];
-    const nextDueIndex = schedule.findIndex((emi) => !emi.paid);
-    if (nextDueIndex === -1) {
-      return res.status(400).json({ success: false, message: 'All installments already paid' });
-    }
-
+    const schedule = loan.emiSchedule || [];
+    const nextDueIndex = schedule.findIndex(e => !e.paid);
+    if (nextDueIndex === -1) return res.status(400).json({ success: false, message: 'All EMIs already paid' });
     const nextDue = schedule[nextDueIndex];
-    if (payAmount < num(nextDue.amount)) {
-      return res.status(400).json({ success: false, message: 'Amount less than EMI due' });
-    }
+    if (payAmount < num(nextDue.amount)) return res.status(400).json({ success: false, message: 'Amount less than EMI due' });
 
-    // mark paid
     schedule[nextDueIndex].paid = true;
     schedule[nextDueIndex].paidOn = new Date();
+    loan.transactions.push({ type: 'repayment', amount: payAmount, date: new Date(), from: req.user._id, to: loan.borrower, remarks: `EMI month ${nextDueIndex + 1}` });
     loan.emiSchedule = schedule;
 
-    // record tx
-    loan.transactions = Array.isArray(loan.transactions) ? loan.transactions : [];
-    loan.transactions.push({
-      type: 'repayment',
-      amount: payAmount,
-      date: new Date(),
-      from: loan.borrower,
-      to: null,
-      remarks: 'EMI repayment',
-    });
+    await payEMI(loanId, req.user._id, payAmount);
 
-    // close if all paid
-    const allPaid = loan.emiSchedule.every((emi) => emi.paid);
+    const allPaid = loan.emiSchedule.every(e => e.paid);
     if (allPaid) loan.status = 'closed';
-
     await loan.save();
 
-    const loanObj = normalizeLoanForFrontend(loan);
-    return res.json({ success: true, message: 'Repayment recorded', loan: loanObj });
+    res.json({ success: true, message: 'Repayment recorded', loan: normalizeLoanForFrontend(loan) });
   } catch (error) {
-    return respondServerError(res, 'Record repayment', error);
+    respondServerError(res, 'Record repayment', error);
   }
 };
 
 /**
  * GET /api/loans
  * Hybrid list: admin -> all loans, borrower -> own loans
- * Returns array directly (frontend expects array)
+ * Returns array directly (your frontend expects an array)
  */
 const getLoansHybrid = async (req, res) => {
   try {
@@ -373,18 +311,18 @@ const getLoansHybrid = async (req, res) => {
 
 /**
  * GET /api/loans/:id
- * Get single loan with access control (admin or borrower owner)
+ * Get single loan with access control (admin or owner borrower)
  */
 const getLoanByIdHybrid = async (req, res) => {
   try {
     const loan = await Loan.findById(req.params.id)
       .populate('borrower', 'name email phone address')
-      .populate('lenders.lender', 'name email phone address')
-      .lean();
+      .populate('lenders.lender', 'name email phone address');
 
     if (!loan) return res.status(404).json({ success: false, message: 'Loan not found' });
 
-    const borrowerId = loan.borrower && (loan.borrower._id ?? loan.borrower);
+    const borrowerId =
+      loan.borrower && (loan.borrower._id ?? loan.borrower);
     const borrowerIdStr =
       borrowerId && typeof borrowerId.toString === 'function'
         ? borrowerId.toString()
@@ -402,22 +340,24 @@ const getLoanByIdHybrid = async (req, res) => {
 
 /**
  * PUT /api/loans/:id  (body: { status })
- * Admin updates loan status
+ * Admin updates loan status (with light transition guards)
  */
 const updateLoanStatus = async (req, res) => {
   try {
     if (!assertRole(req, res, ['admin'])) return;
 
-    const { status } = req.body;
+    const { status } = req.body || {};
     const validStatuses = ['pending', 'approved', 'rejected', 'funding', 'disbursed', 'closed'];
     if (!validStatuses.includes(status)) {
       return res.status(400).json({ success: false, message: 'Invalid status' });
     }
 
-    const loan = await Loan.findById(req.params.id);
+    const loan = await Loan.findById(req.params.id)
+      .populate('borrower', 'email name');
+
     if (!loan) return res.status(404).json({ success: false, message: 'Loan not found' });
 
-    // guard illegal transitions a bit
+    // Guard basic illegal transitions
     if (loan.status === 'rejected' && status !== 'pending') {
       return res.status(400).json({ success: false, message: 'Rejected loans can only move back to pending' });
     }
@@ -431,7 +371,6 @@ const updateLoanStatus = async (req, res) => {
     // notify borrower (non-blocking)
     (async () => {
       try {
-        await loan.populate({ path: 'borrower', select: 'email name' });
         const borrowerEmail = loan.borrower?.email;
         if (borrowerEmail) {
           await sendEmailSafe({
@@ -445,26 +384,20 @@ const updateLoanStatus = async (req, res) => {
       }
     })().catch(() => {});
 
-    const loanObj = normalizeLoanForFrontend(loan);
-    return res.json({ success: true, message: `Loan status updated to ${status}`, loan: loanObj });
+    return res.json({
+      success: true,
+      message: `Loan status updated to ${status}`,
+      loan: normalizeLoanForFrontend(loan),
+    });
   } catch (error) {
     return respondServerError(res, 'Update loan status', error);
   }
 };
 
 /** Admin convenience wrappers (match your routes) */
-const approveLoan = (req, res) => {
-  req.body.status = 'approved';
-  return updateLoanStatus(req, res);
-};
-const rejectLoan = (req, res) => {
-  req.body.status = 'rejected';
-  return updateLoanStatus(req, res);
-};
-const markPending = (req, res) => {
-  req.body.status = 'pending';
-  return updateLoanStatus(req, res);
-};
+const approveLoan = (req, res) => { req.body.status = 'approved'; return updateLoanStatus(req, res); };
+const rejectLoan = (req, res) => { req.body.status = 'rejected'; return updateLoanStatus(req, res); };
+const markPending = (req, res) => { req.body.status = 'pending'; return updateLoanStatus(req, res); };
 
 /**
  * DELETE /api/loans/:id
@@ -513,17 +446,20 @@ const calculateCIBIL = async (req, res) => {
     if (!loans || loans.length === 0) {
       return res.json({ success: true, cibilScore: num(req.user?.cibilScore, 0) });
     }
-    const total = loans.reduce((sum, l) => sum + num(l.cibilScore, 0), 0);
-    const avg = Math.round(total / loans.length);
+    const valid = loans
+      .map((l) => num(l.cibilScore, NaN))
+      .filter((n) => Number.isFinite(n) && n >= 300 && n <= 900);
+
+    const avg = valid.length ? Math.round(valid.reduce((s, n) => s + n, 0) / valid.length) : 0;
     return res.json({ success: true, cibilScore: avg });
   } catch (error) {
     return respondServerError(res, 'Calculate CIBIL', error);
   }
 };
 
-/* ------------------------------------------------------------------
+/* ========================================================================
  * Exports
- * ------------------------------------------------------------------ */
+ * ====================================================================== */
 export {
   applyLoan,
   fundLoan,
@@ -537,4 +473,7 @@ export {
   getUserLoans,
   calculateCIBIL,
   markPending,
+  normalizeLoanForFrontend,
+  disburseLoan,
+  payEMI
 };

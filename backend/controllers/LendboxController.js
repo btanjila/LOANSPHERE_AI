@@ -1,108 +1,129 @@
 // backend/controllers/LendboxController.js
-import Lendbox from '../models/LendboxModel.js';
+import LendboxOffer from '../models/LendboxModel.js';
+import Loan from '../models/LoanModel.js';
 
-// Lender creates a lendbox offer
-const createLendboxOffer = async (req, res) => {
+/**
+ * @desc Create a new Lendbox offer
+ * @route POST /api/lendbox
+ * @access Lender/Admin
+ */
+export const createLendboxOffer = async (req, res) => {
   try {
-    let { amount, tenure, interestRate, remarks } = req.body;
-    amount = Number(amount);
-    tenure = Number(tenure);
-    interestRate = Number(interestRate);
+    const { loanId, amount, interestRate, duration } = req.body;
 
-    if (
-      !amount || amount <= 0 ||
-      !tenure || tenure <= 0 ||
-      !interestRate || interestRate < 0
-    ) {
-      return res.status(400).json({ success: false, message: 'Amount, tenure, and interest rate must be positive numbers' });
+    if (!loanId || !amount || !interestRate || !duration) {
+      return res.status(400).json({ message: 'All fields are required' });
     }
 
-    if (remarks && remarks.length > 500) {
-      remarks = remarks.substring(0, 500); // truncate remarks to 500 chars
+    const loan = await Loan.findById(loanId);
+    if (!loan) {
+      return res.status(404).json({ message: 'Loan not found' });
     }
 
-    const offer = await Lendbox.create({
+    const offer = await LendboxOffer.create({
+      loan: loanId,
       lender: req.user._id,
       amount,
-      tenure,
       interestRate,
-      remarks,
-      status: 'available'
+      duration,
+      status: 'pending',
     });
 
-    res.status(201).json({ success: true, message: 'Lendbox offer created', offer });
+    res.status(201).json({ message: 'Offer created successfully', offer });
   } catch (error) {
-    console.error('Create lendbox offer error:', error);
-    res.status(500).json({ success: false, message: 'Failed to create lendbox offer' });
+    console.error('Error creating Lendbox offer:', error);
+    res.status(500).json({ message: 'Server error', error: error.message });
   }
 };
 
-// Get lendbox offers: admin sees all, lender sees own
-const getLendboxOffers = async (req, res) => {
+/**
+ * @desc Get all Lendbox offers (Admin can see all, Lender sees own)
+ * @route GET /api/lendbox
+ * @access Admin/Lender
+ */
+export const getLendboxOffers = async (req, res) => {
   try {
-    const filter = req.user.role === 'admin' ? {} : { lender: req.user._id };
-    const offers = await Lendbox.find(filter)
-      .populate('lender', 'name email phone')
-      .sort({ createdAt: -1 });
-
-    res.json({ success: true, count: offers.length, offers });
-  } catch (error) {
-    console.error('Get lendbox offers error:', error);
-    res.status(500).json({ success: false, message: 'Failed to fetch lendbox offers' });
-  }
-};
-
-// Update lendbox offer status (admin only)
-const updateLendboxStatus = async (req, res) => {
-  try {
-    if (req.user.role !== 'admin') {
-      return res.status(403).json({ success: false, message: 'Admins only' });
+    let offers;
+    if (req.user.role === 'admin') {
+      offers = await LendboxOffer.find()
+        .populate('loan', 'amountRequested status')
+        .populate('lender', 'name email');
+    } else {
+      offers = await LendboxOffer.find({ lender: req.user._id })
+        .populate('loan', 'amountRequested status')
+        .populate('lender', 'name email');
     }
 
+    res.status(200).json(offers);
+  } catch (error) {
+    console.error('Error fetching Lendbox offers:', error);
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+};
+
+/**
+ * @desc Update Lendbox offer status (approve/reject)
+ * @route PUT /api/lendbox/:id
+ * @access Admin
+ */
+export const updateLendboxStatus = async (req, res) => {
+  try {
     const { status } = req.body;
-    const validStatuses = ['available', 'funded', 'closed'];
-    if (!validStatuses.includes(status)) {
-      return res.status(400).json({ success: false, message: 'Invalid status' });
+    const offer = await LendboxOffer.findById(req.params.id);
+
+    if (!offer) {
+      return res.status(404).json({ message: 'Offer not found' });
     }
 
-    const offer = await Lendbox.findById(req.params.id);
-    if (!offer) {
-      return res.status(404).json({ success: false, message: 'Offer not found' });
+    if (!['approved', 'rejected'].includes(status)) {
+      return res.status(400).json({ message: 'Invalid status' });
     }
 
     offer.status = status;
     await offer.save();
 
-    res.json({ success: true, message: `Offer status updated to ${status}`, offer });
+    // Update Loan funding when approved
+    if (status === 'approved') {
+      const loan = await Loan.findById(offer.loan);
+      if (loan) {
+        loan.amountFunded += offer.amount;
+        if (loan.amountFunded >= loan.amountRequested) {
+          loan.status = 'funded';
+        }
+        await loan.save();
+      }
+    }
+
+    res.status(200).json({ message: 'Offer status updated successfully', offer });
   } catch (error) {
-    console.error('Update lendbox status error:', error);
-    res.status(500).json({ success: false, message: 'Failed to update lendbox status' });
+    console.error('Error updating Lendbox status:', error);
+    res.status(500).json({ message: 'Server error', error: error.message });
   }
 };
 
-// Delete lendbox offer (admin only)
-const deleteLendboxOffer = async (req, res) => {
+/**
+ * @desc Delete a Lendbox offer
+ * @route DELETE /api/lendbox/:id
+ * @access Lender/Admin
+ */
+export const deleteLendboxOffer = async (req, res) => {
   try {
-    if (req.user.role !== 'admin') {
-      return res.status(403).json({ success: false, message: 'Admins only' });
+    const offer = await LendboxOffer.findById(req.params.id);
+
+    if (!offer) {
+      return res.status(404).json({ message: 'Offer not found' });
     }
 
-    const offer = await Lendbox.findById(req.params.id);
-    if (!offer) {
-      return res.status(404).json({ success: false, message: 'Offer not found' });
+    // Only admin or owner lender can delete
+    if (req.user.role !== 'admin' && offer.lender.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ message: 'Not authorized to delete this offer' });
     }
 
     await offer.deleteOne();
-    res.json({ success: true, message: 'Offer deleted successfully' });
-  } catch (error) {
-    console.error('Delete lendbox offer error:', error);
-    res.status(500).json({ success: false, message: 'Failed to delete lendbox offer' });
-  }
-};
 
-export {
-  createLendboxOffer,
-  getLendboxOffers,
-  updateLendboxStatus,
-  deleteLendboxOffer,
+    res.status(200).json({ message: 'Offer deleted successfully' });
+  } catch (error) {
+    console.error('Error deleting Lendbox offer:', error);
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
 };

@@ -1,253 +1,184 @@
 // backend/controllers/authController.js
-import jwt from 'jsonwebtoken';
 import User from '../models/UserModel.js';
-import { body } from 'express-validator';
+import jwt from 'jsonwebtoken';
+import bcrypt from 'bcryptjs';
 import rateLimit from 'express-rate-limit';
+import { body, validationResult } from 'express-validator';
 
 /**
- * NOTE:
- * - Ensure dotenv.config() is run early in your server entry (server.js) so process.env is populated.
- * - Ensure cookie-parser middleware is enabled in server.js (app.use(cookieParser())) so refresh token cookie can be read.
+ * ===========================================================
+ * Helper Functions
+ * ===========================================================
  */
 
-const allowedRoles = ['admin', 'borrower', 'lender'];
+// Generate JWT Token
+const generateToken = (userId, role) => {
+  return jwt.sign({ id: userId, role }, process.env.JWT_SECRET, {
+    expiresIn: process.env.JWT_EXPIRES_IN || '1h',
+  });
+};
 
-/* -------------------------
-  Validation rules (express-validator)
-   ------------------------- */
+// Generate Refresh Token
+const generateRefreshToken = (userId, role) => {
+  return jwt.sign({ id: userId, role }, process.env.JWT_REFRESH_SECRET, {
+    expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '7d',
+  });
+};
+
+/**
+ * ===========================================================
+ * Middlewares: Validations & Rate Limiters
+ * ===========================================================
+ */
+
+// Registration Validation
 export const registerValidationRules = [
-  body('name').trim().notEmpty().withMessage('Name is required'),
-  body('email').isEmail().normalizeEmail().withMessage('Valid email is required'),
+  body('name').notEmpty().withMessage('Name is required'),
+  body('email').isEmail().withMessage('Valid email is required'),
   body('password')
-    .isLength({ min: 8 }).withMessage('Password must be at least 8 characters')
-    .matches(/[a-z]/).withMessage('Password must contain a lowercase letter')
-    .matches(/[A-Z]/).withMessage('Password must contain an uppercase letter')
-    .matches(/\d/).withMessage('Password must contain a number')
-    .matches(/[!@#$%^&*]/).withMessage('Password must contain a special character'),
-  body('role').optional().isIn(allowedRoles).withMessage('Invalid role'),
+    .isLength({ min: 6 })
+    .withMessage('Password should be at least 6 characters long'),
+  body('role')
+    .optional()
+    .isIn(['admin', 'borrower', 'lender'])
+    .withMessage('Invalid role specified'),
 ];
 
+// Login Validation
 export const loginValidationRules = [
-  body('email').isEmail().normalizeEmail().withMessage('Valid email is required'),
+  body('email').isEmail().withMessage('Valid email is required'),
   body('password').notEmpty().withMessage('Password is required'),
 ];
 
-/* -------------------------
-  Rate limiter (for login)
-   ------------------------- */
+// Login Rate Limiter (Prevent brute force)
 export const loginLimiter = rateLimit({
-  windowMs: 10 * 60 * 1000, // 10 minutes
-  max: 5,
-  message: {
-    success: false,
-    message: 'Too many login attempts, please try again after 10 minutes',
-  },
-  standardHeaders: true,
-  legacyHeaders: false,
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10, // limit each IP to 10 requests per windowMs
+  message: { success: false, message: 'Too many login attempts, please try again later.' },
 });
 
-/* -------------------------
-  Helpers: generate tokens
-   ------------------------- */
-const generateAccessToken = (user) => {
-  const secret = process.env.JWT_SECRET;
-  if (!secret) throw new Error('JWT_SECRET env var not set');
-  // short lived access token
-  return jwt.sign({ id: user._id, role: user.role }, secret, {
-    expiresIn: process.env.ACCESS_TOKEN_EXPIRY || '1d',
-  });
-};
+/**
+ * ===========================================================
+ * Controller Functions
+ * ===========================================================
+ */
 
-const generateRefreshToken = (user) => {
-  const secret = process.env.JWT_REFRESH_SECRET;
-  if (!secret) throw new Error('JWT_REFRESH_SECRET env var not set');
-  // longer lived refresh token
-  return jwt.sign({ id: user._id, role: user.role }, secret, {
-    expiresIn: process.env.REFRESH_TOKEN_EXPIRY || '7d',
-  });
-};
-
-/* -------------------------
-  Controller: Register
-   ------------------------- */
+// @desc    Register new user
+// @route   POST /api/auth/register
+// @access  Public
 export const registerUser = async (req, res) => {
   try {
-    const { name, email, password, role } = req.body || {};
-
-    if (!name || !email || !password) {
-      return res.status(400).json({ success: false, message: 'Name, email and password are required' });
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, errors: errors.array() });
     }
 
-    const normalizedEmail = email.toLowerCase();
-    const existingUser = await User.findOne({ email: normalizedEmail });
+    const { name, email, password, role, phone, address } = req.body;
+
+    // Check if email already exists
+    const existingUser = await User.findOne({ email });
     if (existingUser) {
-      return res.status(400).json({ success: false, message: 'User already exists' });
+      return res.status(400).json({ success: false, message: 'User already exists with this email.' });
     }
 
-    const userRole = allowedRoles.includes(role) ? role : 'borrower';
-
+    // Create new user
     const user = await User.create({
-      name: name.trim(),
-      email: normalizedEmail,
+      name,
+      email,
       password,
-      role: userRole,
+      role: role || 'borrower',
+      phone,
+      address,
+      cibilScore: 700, // default baseline score
     });
 
-    // Generate tokens
-    const accessToken = generateAccessToken(user);
-    const refreshToken = generateRefreshToken(user);
+    // Tokens
+    const token = generateToken(user._id, user.role);
+    const refreshToken = generateRefreshToken(user._id, user.role);
 
-    // send refresh token as httpOnly cookie
-    const cookieOptions = {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'strict',
-      maxAge: (process.env.REFRESH_COOKIE_MAX_AGE && Number(process.env.REFRESH_COOKIE_MAX_AGE)) || 7 * 24 * 60 * 60 * 1000,
-      path: '/api/auth/refresh-token',
-    };
-    res.cookie('refreshToken', refreshToken, cookieOptions);
-
-    return res.status(201).json({
+    res.status(201).json({
       success: true,
-      token: accessToken,
+      message: 'User registered successfully',
       user: {
         id: user._id,
         name: user.name,
         email: user.email,
         role: user.role,
+        phone: user.phone,
+        address: user.address,
+        cibilScore: user.cibilScore,
       },
+      token,
+      refreshToken,
     });
   } catch (error) {
-    console.error('❌ Register Error:', error);
-    // If generate token failed due to missing env, return 500
-    return res.status(500).json({ success: false, message: 'Server error' });
+    console.error('Register Error:', error.message);
+    res.status(500).json({ success: false, message: 'Server Error during registration' });
   }
 };
 
-/* -------------------------
-  Controller: Login
-   ------------------------- */
+// @desc    Login user
+// @route   POST /api/auth/login
+// @access  Public
 export const loginUser = async (req, res) => {
   try {
-    const { email, password } = req.body || {};
-    if (!email || !password) return res.status(400).json({ success: false, message: 'Email and password required' });
-
-    const normalizedEmail = email.trim().toLowerCase();
-    const user = await User.findOne({ email: normalizedEmail });
-
-    // Account lockout (optional fields in user model)
-    if (user && user.lockUntil && user.lockUntil > Date.now()) {
-      return res.status(423).json({
-        success: false,
-        message: 'Account temporarily locked due to multiple failed login attempts. Try again later.',
-      });
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, errors: errors.array() });
     }
 
-    if (!user || !(await user.matchPassword(password))) {
-      // increment failed attempts if user exists (optional)
-      if (user) {
-        user.failedLoginAttempts = (user.failedLoginAttempts || 0) + 1;
-        if (user.failedLoginAttempts >= 5) {
-          user.lockUntil = Date.now() + 15 * 60 * 1000; // 15 min lock
-        }
-        await user.save();
-      }
+    const { email, password } = req.body;
+
+    // Check if user exists
+    const user = await User.findOne({ email });
+    if (!user) {
       return res.status(401).json({ success: false, message: 'Invalid credentials' });
     }
 
-    // successful login: reset failed attempts (optional)
-    if (user.failedLoginAttempts || user.lockUntil) {
-      user.failedLoginAttempts = 0;
-      user.lockUntil = null;
-      await user.save();
+    // Account lock check
+    if (user.lockUntil && user.lockUntil > Date.now()) {
+      return res.status(403).json({ success: false, message: 'Account locked. Try again later.' });
     }
 
-    // generate tokens
-    const accessToken = generateAccessToken(user);
-    const refreshToken = generateRefreshToken(user);
+    // Validate password
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch) {
+      user.failedLoginAttempts += 1;
 
-    const cookieOptions = {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'strict',
-      maxAge: (process.env.REFRESH_COOKIE_MAX_AGE && Number(process.env.REFRESH_COOKIE_MAX_AGE)) || 7 * 24 * 60 * 60 * 1000,
-      path: '/api/auth/refresh-token',
-    };
-    res.cookie('refreshToken', refreshToken, cookieOptions);
+      if (user.failedLoginAttempts >= 5) {
+        user.lockUntil = Date.now() + 15 * 60 * 1000; // lock for 15 mins
+        await user.save();
+        return res.status(403).json({ success: false, message: 'Account locked due to too many failed attempts.' });
+      }
 
-    return res.json({
+      await user.save();
+      return res.status(401).json({ success: false, message: 'Invalid credentials' });
+    }
+
+    // Reset failed attempts
+    user.failedLoginAttempts = 0;
+    user.lockUntil = null;
+    await user.save();
+
+    // Tokens
+    const token = generateToken(user._id, user.role);
+    const refreshToken = generateRefreshToken(user._id, user.role);
+
+    res.status(200).json({
       success: true,
-      token: accessToken,
+      message: 'Login successful',
       user: {
         id: user._id,
         name: user.name,
         email: user.email,
         role: user.role,
+        cibilScore: user.cibilScore,
       },
+      token,
+      refreshToken,
     });
   } catch (error) {
-    console.error('❌ Login Error:', error);
-    return res.status(500).json({ success: false, message: 'Server error' });
+    console.error('Login Error:', error.message);
+    res.status(500).json({ success: false, message: 'Server Error during login' });
   }
-};
-
-/* -------------------------
-  Controller: Refresh access token
-  POST /api/auth/refresh-token (reads cookie)
-   ------------------------- */
-export const refreshToken = (req, res) => {
-  try {
-    const token = req.cookies?.refreshToken;
-    if (!token) return res.status(401).json({ success: false, message: 'Refresh token missing' });
-
-    const secret = process.env.JWT_REFRESH_SECRET;
-    if (!secret) {
-      console.error('JWT_REFRESH_SECRET not set for refresh endpoint');
-      return res.status(500).json({ success: false, message: 'Server configuration error' });
-    }
-
-    jwt.verify(token, secret, (err, decoded) => {
-      if (err) {
-        return res.status(403).json({ success: false, message: 'Invalid refresh token' });
-      }
-
-      const accessSecret = process.env.JWT_SECRET;
-      if (!accessSecret) {
-        console.error('JWT_SECRET not set when generating access token');
-        return res.status(500).json({ success: false, message: 'Server configuration error' });
-      }
-
-      const newAccessToken = jwt.sign({ id: decoded.id, role: decoded.role }, accessSecret, {
-        expiresIn: process.env.ACCESS_TOKEN_EXPIRY || '1d',
-      });
-
-      return res.json({ success: true, token: newAccessToken });
-    });
-  } catch (error) {
-    console.error('❌ Refresh Token Error:', error);
-    return res.status(500).json({ success: false, message: 'Failed to refresh token' });
-  }
-};
-
-/* -------------------------
-  Controller: Logout - clear refresh cookie
-   ------------------------- */
-export const logoutUser = (req, res) => {
-  res.clearCookie('refreshToken', {
-    httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: 'strict',
-    path: '/api/auth/refresh-token',
-  });
-  return res.json({ success: true, message: 'Logged out successfully' });
-};
-
-export default {
-  registerUser,
-  loginUser,
-  refreshToken,
-  logoutUser,
-  registerValidationRules,
-  loginValidationRules,
-  loginLimiter,
 };

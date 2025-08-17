@@ -5,11 +5,6 @@ import { protect, authorize } from '../middleware/authMiddleware.js';
 
 const router = express.Router();
 
-/**
- * GET /api/dashboard/stats
- * - Admin-only access
- * - Returns statistics data for dashboard
- */
 router.get('/stats', protect, authorize(['admin']), getDashboardStats);
 
 export default router;
