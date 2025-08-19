@@ -1,90 +1,98 @@
-// src/context/AuthContext.js
-import React, {
-  createContext,
-  useState,
-  useContext,
-  useEffect,
-  useCallback,
-} from "react";
+// src/context/AuthContext.jsx
+import React, { createContext, useState, useMemo, useCallback, useContext } from "react";
 import axios from "axios";
 
+const API = "http://localhost:5000/api";
 const AuthContext = createContext();
 
 export const AuthProvider = ({ children }) => {
-  const [user, setUser] = useState(null);
-  const [token, setToken] = useState(localStorage.getItem("token") || null);
-  const [loading, setLoading] = useState(true);
+  const [user, setUser] = useState(() => {
+    const stored = localStorage.getItem("user");
+    return stored ? JSON.parse(stored) : null;
+  });
+  const [token, setToken] = useState(() => localStorage.getItem("token"));
+  const [loading, setLoading] = useState(false);
 
-  // ✅ Fetch user details from backend
-  const fetchUser = useCallback(async () => {
-    if (!token) {
-      setLoading(false);
-      return;
+  // Accepts either (email, password) OR ({ email, password })
+  const login = useCallback(async (arg1, arg2) => {
+    let email, password;
+    if (typeof arg1 === "object" && arg1 !== null) {
+      email = arg1.email;
+      password = arg1.password;
+    } else {
+      email = arg1;
+      password = arg2;
     }
+
     try {
-      const res = await axios.get("/api/users/me", {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      setUser(res.data);
-    } catch (err) {
-      console.error("Error fetching user:", err);
-      logout(); // clear token if invalid
+      setLoading(true);
+      const res = await axios.post(`${API}/auth/login`, { email, password });
+      const { user, token, refreshToken } = res.data;
+      setUser(user);
+      setToken(token);
+      localStorage.setItem("user", JSON.stringify(user));
+      localStorage.setItem("token", token);
+      localStorage.setItem("refreshToken", refreshToken);
+      return { success: true, user, token, refreshToken };
+    } catch (error) {
+      console.error("Login failed:", error.response?.data || error.message);
+      return { success: false, message: error.response?.data?.message || "Login failed" };
     } finally {
       setLoading(false);
     }
-  }, [token]);
+  }, []);
 
-  useEffect(() => {
-    fetchUser();
-  }, [fetchUser]);
-
-  // ✅ Login
-  const login = async (email, password) => {
-    try {
-      const res = await axios.post('http://localhost:5000/api/auth/login', { email, password });
-      const { token: newToken } = res.data;
-      localStorage.setItem("token", newToken);
-      setToken(newToken);
-      return true;
-    } catch (err) {
-      console.error("Login failed:", err);
-      return false;
-    }
-  };
-
-  // ✅ Register
-  const register = async (name, email, password, role) => {
-    try {
-      const res = await axios.post("/api/users/register", {
-        name,
-        email,
-        password,
-        role,
-      });
-      const { token: newToken } = res.data;
-      localStorage.setItem("token", newToken);
-      setToken(newToken);
-      return true;
-    } catch (err) {
-      console.error("Registration failed:", err);
-      return false;
-    }
-  };
-
-  // ✅ Logout
-  const logout = () => {
-    localStorage.removeItem("token");
-    setToken(null);
-    setUser(null);
-  };
-
-  return (
-    <AuthContext.Provider
-      value={{ user, token, login, register, logout, loading }}
-    >
-      {children}
-    </AuthContext.Provider>
+  const register = useCallback(
+    async ({ name, email, password, role = "borrower", phone = "", address = "" }) => {
+      try {
+        setLoading(true);
+        const res = await axios.post(`${API}/auth/register`, {
+          name,
+          email,
+          password,
+          role,
+          phone,
+          address,
+        });
+        const { user, token, refreshToken } = res.data;
+        setUser(user);
+        setToken(token);
+        localStorage.setItem("user", JSON.stringify(user));
+        localStorage.setItem("token", token);
+        localStorage.setItem("refreshToken", refreshToken);
+        return { success: true, user, token, refreshToken };
+      } catch (error) {
+        console.error("Registration failed:", error.response?.data || error.message);
+        return { success: false, message: error.response?.data?.message || "Registration failed" };
+      } finally {
+        setLoading(false);
+      }
+    },
+    []
   );
+
+  const logout = useCallback(() => {
+    setUser(null);
+    setToken(null);
+    localStorage.removeItem("user");
+    localStorage.removeItem("token");
+    localStorage.removeItem("refreshToken");
+  }, []);
+
+  const value = useMemo(
+    () => ({
+      user,
+      token,
+      loading,
+      login,
+      register,
+      logout,
+      isAuthenticated: !!user,
+    }),
+    [user, token, loading, login, register, logout]
+  );
+
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 };
 
 export const useAuth = () => useContext(AuthContext);

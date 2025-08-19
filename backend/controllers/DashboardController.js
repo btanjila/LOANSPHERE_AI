@@ -1,5 +1,5 @@
 // backend/controllers/DashboardController.js
-import Loan from '../models/LoanModel.js';
+import Loan from '../models/Loan.js';
 import User from '../models/UserModel.js';
 import LendboxOffer from '../models/LendboxModel.js';
 
@@ -61,12 +61,10 @@ export const getAdminDashboard = async (req, res) => {
 export const getBorrowerDashboard = async (req, res) => {
   try {
     const userId = req.user._id;
-
     const myLoans = await Loan.find({ borrower: userId });
-    const activeLoans = myLoans.filter((loan) => loan.status === 'approved');
-    const pendingLoans = myLoans.filter((loan) => loan.status === 'pending');
+    const activeLoans = myLoans.filter(loan => loan.status === 'approved');
+    const pendingLoans = myLoans.filter(loan => loan.status === 'pending');
 
-    // Calculate outstanding balance
     const outstandingBalance = activeLoans.reduce(
       (acc, loan) => acc + (loan.amountRequested - loan.amountFunded),
       0
@@ -93,15 +91,11 @@ export const getBorrowerDashboard = async (req, res) => {
 export const getLenderDashboard = async (req, res) => {
   try {
     const userId = req.user._id;
-
     const myOffers = await LendboxOffer.find({ lender: userId });
-    const activeOffers = myOffers.filter((offer) => offer.status === 'approved');
-    const pendingOffers = myOffers.filter((offer) => offer.status === 'pending');
+    const activeOffers = myOffers.filter(offer => offer.status === 'approved');
+    const pendingOffers = myOffers.filter(offer => offer.status === 'pending');
 
-    const totalInvested = activeOffers.reduce(
-      (acc, offer) => acc + (offer.amount || 0),
-      0
-    );
+    const totalInvested = activeOffers.reduce((acc, offer) => acc + (offer.amount || 0), 0);
 
     res.status(200).json({
       totalOffers: myOffers.length,

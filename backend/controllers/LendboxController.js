@@ -1,6 +1,6 @@
 // backend/controllers/LendboxController.js
 import LendboxOffer from '../models/LendboxModel.js';
-import Loan from '../models/LoanModel.js';
+import Loan from '../models/Loan.js';
 
 /**
  * @desc Create a new Lendbox offer

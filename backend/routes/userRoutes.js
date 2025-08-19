@@ -1,13 +1,23 @@
 // backend/routes/userRoutes.js
 import express from 'express';
-import { authUser, getUserProfile, getUserCIBILScore } from '../controllers/userController.js';
+import {
+  getUserProfile,
+  updateUserProfile,
+  changePassword,
+  upsertKYC,
+  getUserCIBILScore,
+} from '../controllers/userController.js';
 import { protect, authorize } from '../middleware/authMiddleware.js';
-import { validateRequest } from '../middleware/validationMiddleware.js';
 
 const router = express.Router();
 
-router.post('/login', authUser);
+// Current user
 router.get('/me', protect, getUserProfile);
+router.put('/me', protect, updateUserProfile);
+router.put('/me/password', protect, changePassword);
+router.put('/me/kyc', protect, upsertKYC);
+
+// Borrower-only CIBIL
 router.get('/me/cibil', protect, authorize(['borrower']), getUserCIBILScore);
 
 export default router;

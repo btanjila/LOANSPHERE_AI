@@ -1,8 +1,6 @@
 // src/pages/Login.js
-
 import React, { useState } from "react";
 import { useNavigate, useLocation, Link } from "react-router-dom";
-import api from "../utils/api";
 import { toast } from "react-toastify";
 import { useAuth } from "../context/AuthContext";
 
@@ -25,24 +23,26 @@ export default function Login() {
     e.preventDefault();
     setLoading(true);
     try {
-      const res = await api.post("/auth/login", formData);
-      const { token, user } = res.data;
-
-      if (!token || !user) {
-        toast.error("Invalid login response.");
+      // Pass the object; AuthContext.login supports object shape
+      const result = await login(formData);
+      if (!result.success) {
+        toast.error(result.message || "Invalid email or password.");
         return;
       }
 
-      login(token, user);
-      toast.success(`Welcome back, ${user.name}!`);
+      const loggedInUser = result.user;
+      toast.success(`Welcome back, ${loggedInUser?.name || "User"}!`);
 
-      // Redirect to original page or role-specific page
       const redirectPath = location.state?.from?.pathname;
-      if (redirectPath) navigate(redirectPath, { replace: true });
-      else if (user.role === "admin") navigate("/dashboard", { replace: true });
-      else navigate("/loans", { replace: true });
-    } catch (err) {
-      toast.error(err.response?.data?.message || "Login failed. Please try again.");
+      if (redirectPath) {
+        navigate(redirectPath, { replace: true });
+      } else if (loggedInUser?.role === "admin") {
+        navigate("/dashboard", { replace: true });
+      } else {
+        navigate("/loans", { replace: true });
+      }
+    } catch {
+      toast.error("Something went wrong during login.");
     } finally {
       setLoading(false);
     }
